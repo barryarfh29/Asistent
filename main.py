@@ -1,4 +1,5 @@
 import re, asyncio, logging, os, random
+from datetime import datetime
 from motor.motor_asyncio import AsyncIOMotorClient
 from pyrogram import Client, filters, idle
 from pyrogram.types import (
@@ -7,6 +8,7 @@ from pyrogram.types import (
     InputTextMessageContent
 )
 from pyrogram.enums import ParseMode
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # --- CONFIGURATION (ENV) ---
 API_ID = int(os.getenv("API_ID", "38886457"))
@@ -27,11 +29,19 @@ config_col = db["config"]
 user = Client("session_user", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING)
 bot = Client("session_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# Kamus memori untuk mencocokkan ID pesan dengan ID pembeli
-waiting_verification = {}
+# Variabel Global Memory
+last_active_buyer = None 
+
+# --- AUTO RESET SETIAP 2 HARI ---
+async def reset_buyer_data():
+    global last_active_buyer
+    last_active_buyer = None
+    logging.info("🧹 AUTO RESET: Memory pembeli dibersihkan.")
+
+scheduler = AsyncIOScheduler()
+scheduler.add_job(reset_buyer_data, "interval", days=2)
 
 # --- HELPER FUNCTIONS ---
-
 async def get_config(key, default):
     res = await config_col.find_one({"key": key})
     return res["val"] if res else default
@@ -80,25 +90,30 @@ def parse_buttons(text):
 
 @user.on_message(filters.private & ~filters.me & ~filters.bot)
 async def assistant_handler(client, msg):
+    global last_active_buyer
     user_id = msg.from_user.id
     text = msg.text.strip().lower() if msg.text else ""
     await pm_users_col.update_one({"user_id": user_id}, {"$set": {"name": msg.from_user.first_name}}, upsert=True)
 
+    # 1. Foto Bukti Transfer
     if msg.photo:
         verif_raw = await get_config("verif_text", "none")
         if verif_raw.lower() != "none":
             await msg.reply(format_html(verif_raw, msg.from_user), parse_mode=ParseMode.HTML)
-        fwd = await msg.forward(PAYMENT_BOT)
-        waiting_verification[fwd.id] = user_id
+        
+        last_active_buyer = user_id # Tandai pembeli aktif
+        await msg.forward(PAYMENT_BOT)
         return
 
-    tagih_keywords = ["lunas", "sudah bayar", "done", "udah bayar", "tf", "transfer", "sudah transfer", "cek"]
+    # 2. Tagih Bukti Transfer
+    tagih_keywords = ["lunas", "sudah bayar", "done", "tf", "transfer", "cek"]
     if any(x in text for x in tagih_keywords) and not msg.photo:
         await msg.reply(format_html("Mohon maaf {mention}, tolong lampirkan <b>Foto Bukti Transfernya</b> agar asisten bisa bantu proses ya 🙏", msg.from_user), parse_mode=ParseMode.HTML)
         return
 
+    # 3. Filter Harga
     produk_list = ["hijab", "indo", "smp", "sma", "baru", "payment", "satuan", "hemat", "premium", "skandal", "super", "record", "baratt", "fans"]
-    tanya_umum = ["halo", "join", "berapa", "price", "daftar", "list", "mau", "kak", "min", "p", "tes", "vip", "info"]
+    tanya_umum = ["halo", "join", "berapa", "price", "daftar", "list", "mau", "kak", "min", "p", "vip", "info"]
     
     is_new = await pm_users_col.count_documents({"user_id": user_id}) <= 1
     is_order = any(x in text for x in produk_list)
@@ -113,6 +128,7 @@ async def assistant_handler(client, msg):
                 await user.send_inline_bot_result(msg.chat.id, inline.query_id, inline.results[0].id)
                 return
 
+    # 4. Auto Search Paket
     if text and is_order and len(text) < 40:
         p1 = await msg.reply(f"🔍 **Cek paket: {msg.text.upper()}**")
         stop_animation = False
@@ -159,48 +175,40 @@ async def assistant_handler(client, msg):
             await p1.edit("❌ **Gagal!** Paket tidak ditemukan.")
             await asyncio.sleep(2); await p1.delete()
 
-# --- HANDLER BALASAN BOT PAYMENT (DIREVISI TOTAL) ---
+# --- HANDLER BALASAN BOT PAYMENT ---
 
 @user.on_message(filters.chat(PAYMENT_BOT) & ~filters.me)
 async def payment_reply_handler(client, msg):
-    # Mencari ID target berdasarkan pesan yang di-reply oleh Bot Payment
-    target_id = None
-    if msg.reply_to_message_id:
-        target_id = waiting_verification.get(msg.reply_to_message_id)
+    global last_active_buyer
+    if not last_active_buyer: return
 
-    if target_id:
-        try:
-            text_bot = (msg.text or "").lower()
-            u_data = await client.get_users(target_id)
+    try:
+        target_id = last_active_buyer
+        text_bot = (msg.text or "").lower()
+        u_data = await client.get_users(target_id)
 
-            # Jika bot payment mengirim pesan gagal/expired
-            if any(x in text_bot for x in ["gagal", "tidak ditemukan", "belum masuk", "nominal salah", "expired"]):
-                await client.send_message(
-                    target_id, 
-                    format_html("Maaf kak {mention}, pembayaran belum masuk. Mohon kirim ulang bukti transfernya ya 🙏", u_data), 
-                    parse_mode=ParseMode.HTML
-                )
-            else:
-                # BAGIAN PENTING: Meneruskan (Forward/Copy) link grup atau detail login ke pembeli
-                await msg.copy(target_id)
-                
-                # Kirim pesan terima kasih opsional
-                thanks_raw = await get_config("thanks_text", "none")
-                if thanks_raw.lower() != "none":
-                    await client.send_message(target_id, format_html(thanks_raw, u_data), parse_mode=ParseMode.HTML)
-            
-            # Hapus antrean agar tidak terjadi spam di transaksi berikutnya
-            waiting_verification.pop(msg.reply_to_message_id, None)
-            
-        except Exception as e:
-            logging.error(f"Gagal meneruskan pesan: {e}")
+        if any(x in text_bot for x in ["gagal", "tidak ditemukan", "belum masuk", "nominal salah", "expired"]):
+            await client.send_message(target_id, format_html("Maaf kak {mention}, pembayaran belum masuk. Mohon cek ulang nominal ya 🙏", u_data), parse_mode=ParseMode.HTML)
+        else:
+            await msg.copy(target_id) # Forward Link VIP
+            thanks_raw = await get_config("thanks_text", "none")
+            if thanks_raw.lower() != "none":
+                await client.send_message(target_id, format_html(thanks_raw, u_data), parse_mode=ParseMode.HTML)
+    except Exception as e:
+        logging.error(f"Error: {e}")
 
 # --- ADMIN COMMANDS ---
 
 @user.on_message(filters.command("help", prefixes=".") & filters.me)
 async def cmd_help(_, msg):
-    help_text = "<b>📂 PANDUAN ASISTEN</b>\n\n• <code>.settextharga</code>\n• <code>.setharga</code>\n• <code>.setverif</code>\n• <code>.setthanks</code>\n• <code>.save</code>\n• <code>.notes</code>\n• <code>.del</code>\n• <code>.broadcast</code>"
+    help_text = "<b>📂 ADMIN ASISTEN</b>\n\n• <code>.settextharga</code>\n• <code>.setharga</code> (reply foto)\n• <code>.setverif</code>\n• <code>.setthanks</code>\n• <code>.save [nama]</code>\n• <code>.notes</code>\n• <code>.resetpembeli</code>\n• <code>.broadcast</code> (reply)"
     await msg.edit(help_text, parse_mode=ParseMode.HTML)
+
+@user.on_message(filters.command("resetpembeli", prefixes=".") & filters.me)
+async def cmd_res(_, msg):
+    global last_active_buyer
+    last_active_buyer = None
+    await msg.edit("🗑️ Memory pembeli dibersihkan!")
 
 @user.on_message(filters.command("setverif", prefixes=".") & filters.me)
 async def cmd_setverif(_, msg):
@@ -214,19 +222,6 @@ async def cmd_setthanks(_, msg):
     await config_col.update_one({"key": "thanks_text"}, {"$set": {"val": txt}}, upsert=True)
     await msg.edit("✅ Pesan Terima Kasih Diset!")
 
-@user.on_message(filters.command("setharga", prefixes=".") & filters.me)
-async def cmd_setharga(_, msg):
-    if not msg.reply_to_message or not msg.reply_to_message.photo: return await msg.edit("❌ Reply ke foto harga!")
-    f_id = await get_bot_file_id(msg.reply_to_message)
-    await notes_col.update_one({"key": "harga"}, {"$set": {"file_id": f_id}}, upsert=True)
-    await msg.edit("✅ Foto Harga Berhasil Diset!")
-
-@user.on_message(filters.command("settextharga", prefixes=".") & filters.me)
-async def cmd_settextharga(_, msg):
-    txt = msg.text.split(maxsplit=1)[1] if len(msg.text.split()) > 1 else ""
-    await notes_col.update_one({"key": "harga"}, {"$set": {"content": txt}}, upsert=True)
-    await msg.edit("✅ Teks Harga Berhasil Diset!")
-
 @user.on_message(filters.command("save", prefixes=".") & filters.me)
 async def cmd_save(_, msg):
     parts = msg.text.split(maxsplit=2)
@@ -235,18 +230,6 @@ async def cmd_save(_, msg):
     f_id = await get_bot_file_id(msg.reply_to_message or msg)
     await notes_col.update_one({"key": key}, {"$set": {"file_id": f_id, "content": content}}, upsert=True)
     await msg.edit(f"✅ Note <code>{key}</code> Disimpan!")
-
-@user.on_message(filters.command("notes", prefixes=".") & filters.me)
-async def cmd_notes(_, msg):
-    all_n = []
-    async for n in notes_col.find(): all_n.append(f"• <code>{n['key']}</code>")
-    await msg.edit("📋 **LIST NOTES:**\n" + ("\n".join(all_n) if all_n else "Kosong"))
-
-@user.on_message(filters.command("del", prefixes=".") & filters.me)
-async def cmd_del(_, msg):
-    key = msg.text.split(maxsplit=1)[1].lower() if len(msg.text.split()) > 1 else ""
-    await notes_col.delete_one({"key": key})
-    await msg.edit(f"✅ Note <code>{key}</code> Dihapus!")
 
 @user.on_message(filters.command("broadcast", prefixes=".") & filters.me)
 async def cmd_broadcast(_, msg):
@@ -260,7 +243,6 @@ async def cmd_broadcast(_, msg):
     await msg.edit(f"✅ Broadcast Selesai! Terkirim ke {count} user.")
 
 # --- INLINE HANDLER ---
-
 @bot.on_inline_query()
 async def inline_handler(_, query):
     note = await notes_col.find_one({"key": query.query.lower().strip()})
@@ -277,8 +259,9 @@ async def inline_handler(_, query):
     await query.answer(res, cache_time=1)
 
 async def main():
+    scheduler.start()
     await user.start(); await bot.start()
-    print("🚀 ASISTEN PREMIUM SIAP TEMPUR!"); await idle()
+    print("🚀 ASISTEN SIAP TEMPUR!"); await idle()
 
 if __name__ == "__main__":
     asyncio.get_event_loop().run_until_complete(main())
