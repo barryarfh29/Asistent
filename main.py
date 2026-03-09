@@ -27,7 +27,7 @@ config_col = db["config"]
 user = Client("session_user", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING)
 bot = Client("session_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# Antrean verifikasi yang ketat
+# Kamus memori untuk mencocokkan ID pesan dengan ID pembeli
 waiting_verification = {}
 
 # --- HELPER FUNCTIONS ---
@@ -84,24 +84,19 @@ async def assistant_handler(client, msg):
     text = msg.text.strip().lower() if msg.text else ""
     await pm_users_col.update_one({"user_id": user_id}, {"$set": {"name": msg.from_user.first_name}}, upsert=True)
 
-    # 1. Foto Bukti Transfer
     if msg.photo:
         verif_raw = await get_config("verif_text", "none")
         if verif_raw.lower() != "none":
             await msg.reply(format_html(verif_raw, msg.from_user), parse_mode=ParseMode.HTML)
-        
-        # Forward ke bot payment dan catat ID-nya secara spesifik
         fwd = await msg.forward(PAYMENT_BOT)
         waiting_verification[fwd.id] = user_id
         return
 
-    # 2. Tagih Bukti Transfer
     tagih_keywords = ["lunas", "sudah bayar", "done", "udah bayar", "tf", "transfer", "sudah transfer", "cek"]
     if any(x in text for x in tagih_keywords) and not msg.photo:
         await msg.reply(format_html("Mohon maaf {mention}, tolong lampirkan <b>Foto Bukti Transfernya</b> agar asisten bisa bantu proses ya 🙏", msg.from_user), parse_mode=ParseMode.HTML)
         return
 
-    # 3. Filter Harga & Tanya Umum
     produk_list = ["hijab", "indo", "smp", "sma", "baru", "payment", "satuan", "hemat", "premium", "skandal", "super", "record", "baratt", "fans"]
     tanya_umum = ["halo", "join", "berapa", "price", "daftar", "list", "mau", "kak", "min", "p", "tes", "vip", "info"]
     
@@ -118,7 +113,6 @@ async def assistant_handler(client, msg):
                 await user.send_inline_bot_result(msg.chat.id, inline.query_id, inline.results[0].id)
                 return
 
-    # 4. Auto Search Paket
     if text and is_order and len(text) < 40:
         p1 = await msg.reply(f"🔍 **Cek paket: {msg.text.upper()}**")
         stop_animation = False
@@ -165,23 +159,21 @@ async def assistant_handler(client, msg):
             await p1.edit("❌ **Gagal!** Paket tidak ditemukan.")
             await asyncio.sleep(2); await p1.delete()
 
-# --- HANDLER BALASAN BOT PAYMENT (BAGIAN YANG DIPERBAIKI) ---
+# --- HANDLER BALASAN BOT PAYMENT (DIREVISI TOTAL) ---
 
 @user.on_message(filters.chat(PAYMENT_BOT) & ~filters.me)
 async def payment_reply_handler(client, msg):
-    # Hanya proses jika bot payment me-reply bukti transfer yang dikirim asisten
-    if not msg.reply_to_message_id:
-        return
+    # Mencari ID target berdasarkan pesan yang di-reply oleh Bot Payment
+    target_id = None
+    if msg.reply_to_message_id:
+        target_id = waiting_verification.get(msg.reply_to_message_id)
 
-    # Cari pembeli yang benar-benar memiliki ID pesan tersebut
-    target_id = waiting_verification.get(msg.reply_to_message_id)
-    
     if target_id:
         try:
             text_bot = (msg.text or "").lower()
             u_data = await client.get_users(target_id)
 
-            # 1. Deteksi Jika Pembayaran Gagal
+            # Jika bot payment mengirim pesan gagal/expired
             if any(x in text_bot for x in ["gagal", "tidak ditemukan", "belum masuk", "nominal salah", "expired"]):
                 await client.send_message(
                     target_id, 
@@ -189,38 +181,25 @@ async def payment_reply_handler(client, msg):
                     parse_mode=ParseMode.HTML
                 )
             else:
-                # 2. Kirim Link/Detail VIP (Copy dari Bot Payment)
+                # BAGIAN PENTING: Meneruskan (Forward/Copy) link grup atau detail login ke pembeli
                 await msg.copy(target_id)
                 
-                # 3. Kirim Pesan Terima Kasih (Jika diset)
+                # Kirim pesan terima kasih opsional
                 thanks_raw = await get_config("thanks_text", "none")
                 if thanks_raw.lower() != "none":
                     await client.send_message(target_id, format_html(thanks_raw, u_data), parse_mode=ParseMode.HTML)
             
-            # 4. HAPUS DARI MEMORI (Sangat Penting agar tidak salah kirim ke pembeli berikutnya)
+            # Hapus antrean agar tidak terjadi spam di transaksi berikutnya
             waiting_verification.pop(msg.reply_to_message_id, None)
             
         except Exception as e:
-            logging.error(f"Error forwarding to {target_id}: {e}")
+            logging.error(f"Gagal meneruskan pesan: {e}")
 
 # --- ADMIN COMMANDS ---
 
 @user.on_message(filters.command("help", prefixes=".") & filters.me)
 async def cmd_help(_, msg):
-    help_text = (
-        "<b>📂 PANDUAN ASISTEN PREMIUM</b>\n\n"
-        "<b>🛠 PENGATURAN</b>\n"
-        "• <code>.settextharga [teks]</code>\n"
-        "• <code>.setharga</code> - (Reply Foto)\n"
-        "• <code>.setverif [teks]</code>\n"
-        "• <code>.setthanks [teks]</code>\n\n"
-        "<b>📝 MANAJEMEN</b>\n"
-        "• <code>.save [nama]</code>\n"
-        "• <code>.notes</code>\n"
-        "• <code>.del [nama]</code>\n"
-        "• <code>.broadcast</code>\n"
-        "• <code>.resetdb</code>\n"
-    )
+    help_text = "<b>📂 PANDUAN ASISTEN</b>\n\n• <code>.settextharga</code>\n• <code>.setharga</code>\n• <code>.setverif</code>\n• <code>.setthanks</code>\n• <code>.save</code>\n• <code>.notes</code>\n• <code>.del</code>\n• <code>.broadcast</code>"
     await msg.edit(help_text, parse_mode=ParseMode.HTML)
 
 @user.on_message(filters.command("setverif", prefixes=".") & filters.me)
@@ -268,11 +247,6 @@ async def cmd_del(_, msg):
     key = msg.text.split(maxsplit=1)[1].lower() if len(msg.text.split()) > 1 else ""
     await notes_col.delete_one({"key": key})
     await msg.edit(f"✅ Note <code>{key}</code> Dihapus!")
-
-@user.on_message(filters.command("resetdb", prefixes=".") & filters.me)
-async def cmd_resetdb(_, msg):
-    await pm_users_col.delete_many({}); await notes_col.delete_many({}); await config_col.delete_many({})
-    await msg.edit("🗑️ Database dibersihkan total!")
 
 @user.on_message(filters.command("broadcast", prefixes=".") & filters.me)
 async def cmd_broadcast(_, msg):
