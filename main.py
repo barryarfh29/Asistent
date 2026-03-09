@@ -27,6 +27,7 @@ config_col = db["config"]
 user = Client("session_user", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING)
 bot = Client("session_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
+# Antrean verifikasi yang ketat
 waiting_verification = {}
 
 # --- HELPER FUNCTIONS ---
@@ -88,17 +89,19 @@ async def assistant_handler(client, msg):
         verif_raw = await get_config("verif_text", "none")
         if verif_raw.lower() != "none":
             await msg.reply(format_html(verif_raw, msg.from_user), parse_mode=ParseMode.HTML)
+        
+        # Forward ke bot payment dan catat ID-nya secara spesifik
         fwd = await msg.forward(PAYMENT_BOT)
         waiting_verification[fwd.id] = user_id
         return
 
-    # 2. Tagih Bukti Transfer (Anti-Nipu)
+    # 2. Tagih Bukti Transfer
     tagih_keywords = ["lunas", "sudah bayar", "done", "udah bayar", "tf", "transfer", "sudah transfer", "cek"]
     if any(x in text for x in tagih_keywords) and not msg.photo:
-        await msg.reply(format_html("Mohon maaf {mention}, tolong lampirkan <b>Foto Bukti Transfernya</b> (Screenshot) agar asisten bisa bantu proses ke sistem ya 🙏", msg.from_user), parse_mode=ParseMode.HTML)
+        await msg.reply(format_html("Mohon maaf {mention}, tolong lampirkan <b>Foto Bukti Transfernya</b> agar asisten bisa bantu proses ya 🙏", msg.from_user), parse_mode=ParseMode.HTML)
         return
 
-    # 3. Filter Harga & Stiker
+    # 3. Filter Harga & Tanya Umum
     produk_list = ["hijab", "indo", "smp", "sma", "baru", "payment", "satuan", "hemat", "premium", "skandal", "super", "record", "baratt", "fans"]
     tanya_umum = ["halo", "join", "berapa", "price", "daftar", "list", "mau", "kak", "min", "p", "tes", "vip", "info"]
     
@@ -115,7 +118,7 @@ async def assistant_handler(client, msg):
                 await user.send_inline_bot_result(msg.chat.id, inline.query_id, inline.results[0].id)
                 return
 
-    # 4. Auto Search Paket + Animasi
+    # 4. Auto Search Paket
     if text and is_order and len(text) < 40:
         p1 = await msg.reply(f"🔍 **Cek paket: {msg.text.upper()}**")
         stop_animation = False
@@ -162,25 +165,43 @@ async def assistant_handler(client, msg):
             await p1.edit("❌ **Gagal!** Paket tidak ditemukan.")
             await asyncio.sleep(2); await p1.delete()
 
-# --- HANDLER BALASAN BOT PAYMENT ---
+# --- HANDLER BALASAN BOT PAYMENT (BAGIAN YANG DIPERBAIKI) ---
 
 @user.on_message(filters.chat(PAYMENT_BOT) & ~filters.me)
 async def payment_reply_handler(client, msg):
-    target_id = waiting_verification.get(msg.reply_to_message_id) or (list(waiting_verification.values())[-1] if waiting_verification else None)
+    # Hanya proses jika bot payment me-reply bukti transfer yang dikirim asisten
+    if not msg.reply_to_message_id:
+        return
+
+    # Cari pembeli yang benar-benar memiliki ID pesan tersebut
+    target_id = waiting_verification.get(msg.reply_to_message_id)
+    
     if target_id:
-        text_bot = (msg.text or "").lower()
-        # Deteksi Saldo Gagal/Pending
-        if any(x in text_bot for x in ["gagal", "tidak ditemukan", "belum masuk", "nominal salah", "expired"]):
+        try:
+            text_bot = (msg.text or "").lower()
             u_data = await client.get_users(target_id)
-            await client.send_message(target_id, format_html("Maaf kak {mention}, pembayaran belum masuk atau tidak ditemukan sistem. Mohon pastikan nominal sesuai dan kirim ulang bukti transfernya ya 🙏", u_data), parse_mode=ParseMode.HTML)
-        else:
-            await msg.copy(target_id)
-            if "http" in (msg.text or "") or msg.reply_markup:
+
+            # 1. Deteksi Jika Pembayaran Gagal
+            if any(x in text_bot for x in ["gagal", "tidak ditemukan", "belum masuk", "nominal salah", "expired"]):
+                await client.send_message(
+                    target_id, 
+                    format_html("Maaf kak {mention}, pembayaran belum masuk. Mohon kirim ulang bukti transfernya ya 🙏", u_data), 
+                    parse_mode=ParseMode.HTML
+                )
+            else:
+                # 2. Kirim Link/Detail VIP (Copy dari Bot Payment)
+                await msg.copy(target_id)
+                
+                # 3. Kirim Pesan Terima Kasih (Jika diset)
                 thanks_raw = await get_config("thanks_text", "none")
                 if thanks_raw.lower() != "none":
-                    u_data = await client.get_users(target_id)
                     await client.send_message(target_id, format_html(thanks_raw, u_data), parse_mode=ParseMode.HTML)
-        waiting_verification.pop(msg.reply_to_message_id, None)
+            
+            # 4. HAPUS DARI MEMORI (Sangat Penting agar tidak salah kirim ke pembeli berikutnya)
+            waiting_verification.pop(msg.reply_to_message_id, None)
+            
+        except Exception as e:
+            logging.error(f"Error forwarding to {target_id}: {e}")
 
 # --- ADMIN COMMANDS ---
 
@@ -189,24 +210,16 @@ async def cmd_help(_, msg):
     help_text = (
         "<b>📂 PANDUAN ASISTEN PREMIUM</b>\n\n"
         "<b>🛠 PENGATURAN</b>\n"
-        "• <code>.settextharga [teks]</code> - Set caption harga.\n"
-        "• <code>.setharga</code> - (Reply Foto) Set foto harga.\n"
-        "• <code>.setverif [teks]</code> - Pesan saat user kirim bukti.\n"
-        "• <code>.setthanks [teks]</code> - Pesan saat join sukses.\n\n"
+        "• <code>.settextharga [teks]</code>\n"
+        "• <code>.setharga</code> - (Reply Foto)\n"
+        "• <code>.setverif [teks]</code>\n"
+        "• <code>.setthanks [teks]</code>\n\n"
         "<b>📝 MANAJEMEN</b>\n"
-        "• <code>.save [nama]</code> - Simpan note (bisa reply foto).\n"
-        "• <code>.notes</code> - List semua note.\n"
-        "• <code>.del [nama]</code> - Hapus note.\n"
-        "• <code>.broadcast</code> - (Reply pesan) BC ke semua user.\n"
-        "• <code>.resetdb</code> - Hapus database.\n\n"
-        "<b>🔘 PANDUAN TOMBOL (BUTTON)</b>\n"
-        "Untuk membuat tombol, gunakan format:\n"
-        "<code>[Nama](buttonurl:link)</code>\n\n"
-        "<b>Contoh 2 Tombol Sejajar & 1 Bawah:</b>\n"
-        "<code>[TOMBOL 1](buttonurl:link1)</code>\n"
-        "<code>[TOMBOL 2](buttonurl:link2:same)</code>\n"
-        "<code>[TOMBOL 3](buttonurl:link3)</code>\n\n"
-        "<i>Note: Gunakan {mention} agar nama user berwarna biru.</i>"
+        "• <code>.save [nama]</code>\n"
+        "• <code>.notes</code>\n"
+        "• <code>.del [nama]</code>\n"
+        "• <code>.broadcast</code>\n"
+        "• <code>.resetdb</code>\n"
     )
     await msg.edit(help_text, parse_mode=ParseMode.HTML)
 
