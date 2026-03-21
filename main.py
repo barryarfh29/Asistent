@@ -5,85 +5,82 @@ from pyrogram import Client, filters, idle
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.enums import ParseMode
 
-# --- CONFIGURATION (Ganti sesuai data kakak) ---
+# --- KONFIGURASI (WAJIB DIISI) ---
 API_ID = int(os.getenv("API_ID", "38886457"))
 API_HASH = os.getenv("API_HASH", "93ae4287da188cb3ba23a620c8ca5bd4")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8655576331:AAEL8MJraLvAxcmoevPjpNeU01id-ELriKM")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8655576331:AAEL8MJraLvAxcmoevPjpNeU01id-ELriKM") # Token Bot Asisten Kakak
 SESSION_STRING = os.getenv("SESSION_STRING")
 MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://Nadira31:Nadira31@cluster0.81zcrwl.mongodb.net/?appName=Cluster0")
-PAYMENT_BOT = "WarungLENDIR_Robot"
 
-# Target Milestone
+# Target Username
+PAYMENT_BOT = "WarungLENDIR_Robot"
+ADMIN_USER = "belaa"
+
+# Aturan Hadiah
 TARGET_KLIK = 100
 TARGET_SALES = 3
 
 logging.basicConfig(level=logging.INFO)
-
 m_client = AsyncIOMotorClient(MONGO_URI)
 db = m_client["userbot_db"]
 reff_col = db["referrals"]
 pm_users_col = db["pm_users"]
 hashes_col = db["processed_hashes"]
-config_col = db["config"]
 
 user = Client("session_user", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING)
 bot = Client("session_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# --- UTILS ---
-async def get_config(key, default):
-    res = await config_col.find_one({"key": key})
-    return res["val"] if res else default
-
-def format_html(text, user_obj):
-    if not text: return ""
-    name = user_obj.first_name or "Kakak"
-    mention = f"<a href='tg://user?id={user_obj.id}'>{name}</a>"
-    return text.replace("{mention}", mention).replace("{name}", name)
-
-async def get_photo_hash(client, message):
-    photo = await client.download_media(message, in_memory=True)
-    return hashlib.md5(photo.getbuffer()).hexdigest()
-
-# --- 1. HANDLER START (DETEKSI KLIK REFERRAL) ---
+# --- 1. LOGIKA BOT (PINTU MASUK REFERRAL) ---
 @bot.on_message(filters.command("start") & filters.private)
 async def start_handler(client, msg):
     u_id = msg.from_user.id
     args = msg.text.split()
     
+    # Cek jika masuk lewat link invite
     if len(args) > 1 and "invite_" in args[1]:
         inviter_id = int(args[1].replace("invite_", ""))
-        # Cek apakah user ini benar-benar baru di sistem kita
+        
+        # Cek apakah ini user baru murni
         is_new = await pm_users_col.find_one({"user_id": u_id}) is None
         
         if is_new and inviter_id != u_id:
-            # +1 Klik Poin di Database
+            # +1 Klik Poin untuk Pengundang
             res = await reff_col.find_one_and_update(
                 {"user_id": inviter_id},
                 {"$inc": {"click_points": 1}},
                 upsert=True, return_document=True
             )
-            # Simpan data pengundang di profil user baru
+            # Simpan data siapa yang mengundang user ini
             await pm_users_col.update_one(
                 {"user_id": u_id},
-                {"$set": {"invited_by": inviter_id}},
+                {"$set": {"invited_by": inviter_id, "join_date": datetime.now()}},
                 upsert=True
             )
-            # Notifikasi Milestone 100 Klik
+            # Notif ke pengundang jika mencapai 100 klik
             if res.get("click_points") == TARGET_KLIK:
-                try: await user.send_message(inviter_id, "🔥 **MISI VIRAL SELESAI!**\n100 Orang telah klik linkmu. Kamu dapat **DISKON 50%**. Hubungi admin!")
+                try: await user.send_message(inviter_id, "🔥 **MISI VIRAL SELESAI!**\n100 Orang klik linkmu. Kamu dapat **DISKON 50%**.")
                 except: pass
 
-    # Registrasi User
-    await pm_users_col.update_one({"user_id": u_id}, {"$set": {"last_active": datetime.now()}}, upsert=True)
-    await msg.reply("<b>Selamat Datang di Syndicate Asahan!</b>\nKirim bukti TF untuk join VIP, atau ketik <code>.reff</code> untuk ambil link referralmu.")
+    # Tampilan Menu dengan Tombol ke @WarungLENDIR_Robot
+    btn = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🛒 ORDER VIA @WarungLENDIR_Robot", url=f"https://t.me/{PAYMENT_BOT}")],
+        [InlineKeyboardButton("👩‍💻 CHAT ASISTEN @belaa", url=f"https://t.me/{ADMIN_USER}")],
+        [InlineKeyboardButton("🎁 CEK STATUS REFF", callback_data="none")]
+    ])
+    
+    await msg.reply(
+        "<b>SYNDICATE VIP ACCESS</b>\n\n"
+        "Gunakan tombol di bawah untuk memesan VIP atau bertanya pada asisten.",
+        reply_markup=btn
+    )
 
-# --- 2. HANDLER ASISTEN (USER SESSION) ---
+# --- 2. LOGIKA USERBOT (PANEL REFF & TRACKING) ---
 @user.on_message(filters.private & ~filters.me & ~filters.bot)
-async def assistant_handler(client, msg):
+async def userbot_assistant(client, msg):
     u_id = msg.from_user.id
     text = (msg.text or "").lower().strip()
 
-    # A. TAMPILKAN PANEL REFERRAL
+    # Perintah memunculkan link referral
     if text in [".reff", ".referral", "/reff", "/referral"]:
         bot_me = await bot.get_me()
         link = f"https://t.me/{bot_me.username}?start=invite_{u_id}"
@@ -91,61 +88,51 @@ async def assistant_handler(client, msg):
         k = data.get("click_points", 0) if data else 0
         s = data.get("success_sales", 0) if data else 0
         
-        panel_text = (
+        panel = (
             f"👑 **PANEL AFFILIATE SYNDICATE**\n\n"
-            f"Bagikan link ini ke teman/grup:\n<code>{link}</code>\n\n"
-            f"📊 **PROGRES HADIAH:**\n"
-            f"• Misi Viral: **{k}/{TARGET_KLIK}** Klik (Diskon 50%)\n"
-            f"• Misi Sales: **{s}/{TARGET_SALES}** Beli (VIP Gratis)\n\n"
-            f"⚠️ *Poin sales hanya masuk jika temanmu membeli lewat Asisten ini.*"
+            f"Link Undangan:\n<code>{link}</code>\n\n"
+            f"📊 **PROGRES ANDA:**\n"
+            f"• Klik Viral: **{k}/{TARGET_KLIK}**\n"
+            f"• Sales Berhasil: **{s}/{TARGET_SALES}**\n\n"
+            f"<i>Poin sales hanya masuk jika temanmu transaksi lewat asisten ini.</i>"
         )
-        await msg.reply(panel_text, parse_mode=ParseMode.HTML)
+        await msg.reply(panel, parse_mode=ParseMode.HTML)
         return
 
-    # B. LOGIKA FOTO & ANTI-SPAM BUKTI TF
+    # Logika Kirim Bukti (Foto)
     if msg.photo:
-        f_hash = await get_photo_hash(client, msg)
-        if await hashes_col.find_one({"hash": f_hash}):
-            return await msg.reply("⚠️ Bukti transfer ini sudah diproses. Mohon jangan spam!")
-        
-        await hashes_col.insert_one({"hash": f_hash, "user_id": u_id, "date": datetime.now()})
-        # Tandai sedang menunggu bayar (untuk sistem antrean)
+        # Tandai user sedang dalam proses bayar
         await pm_users_col.update_one(
-            {"user_id": u_id}, 
-            {"$set": {"waiting_payment": True, "last_interaction": datetime.now()}}, 
+            {"user_id": u_id},
+            {"$set": {"waiting_payment": True, "last_interaction": datetime.now()}},
             upsert=True
         )
+        # Teruskan ke Bot Payment
         await msg.forward(PAYMENT_BOT)
-        await msg.reply("🛡️ **Sedang diverifikasi...** Mohon tunggu sebentar.")
-        return
+        await msg.reply("🛡️ **Bukti terkirim!** Sedang dicek oleh system.")
 
-# --- 3. HANDLER PAYMENT BOT (POIN SALES HANYA LEWAT USERBOT) ---
+# --- 3. LOGIKA TRACKING SALES (DARI @WarungLENDIR_Robot) ---
 @user.on_message(filters.chat(PAYMENT_BOT) & ~filters.me)
-async def payment_handler(client, msg):
+async def payment_checker(client, msg):
     text_bot = (msg.text or "").lower()
     
-    # Ambil pembeli yang paling baru mengirim bukti ke USERBOT
+    # Ambil pembeli yang terakhir kirim bukti
     buyer = await pm_users_col.find_one({"waiting_payment": True}, sort=[("last_interaction", -1)])
     if not buyer: return
     
     target_id = buyer["user_id"]
-    u_obj = await client.get_users(target_id)
 
-    # Jika Terdeteksi Link Join (Sukses)
+    # Jika Bot Payment kasih Link VIP (Artinya Bayar Berhasil)
     if "t.me/+" in text_bot or "t.me/joinchat" in text_bot:
-        # 1. Kirim & Pin Link ke Pembeli
-        sent_msg = await msg.copy(target_id)
-        await sent_msg.pin(both_sides=True)
-        
-        thanks_raw = await get_config("thanks_text", "Terima kasih {mention} sudah join Syndicate!")
-        await client.send_message(target_id, format_html(thanks_raw, u_obj))
-        
-        # 2. Matikan Status Waiting
+        # Kirim Link ke Pembeli
+        await msg.copy(target_id)
+        # Matikan status waiting
         await pm_users_col.update_one({"user_id": target_id}, {"$set": {"waiting_payment": False}})
 
-        # 3. LOGIKA SALES POINT (HANYA UNTUK USER YANG ADA DI DB USERBOT)
+        # CEK APAKAH PEMBELI INI HASIL UNDANGAN
         if "invited_by" in buyer:
             inviter_id = buyer["invited_by"]
+            
             # +1 Poin Sales Sukses
             res_sales = await reff_col.find_one_and_update(
                 {"user_id": inviter_id},
@@ -154,18 +141,19 @@ async def payment_handler(client, msg):
             )
             
             s_count = res_sales.get("success_sales", 0)
+            
             if s_count >= TARGET_SALES:
-                # Milestone 3 Penjualan Tercapai
-                await user.send_message(inviter_id, "🎊 **CONGRATS! 3 SALES BERHASIL!**\nKamu berhak dapat **1 Channel VIP Gratis**. Silakan pilih daftar channelnya di admin!")
-                await reff_col.update_one({"user_id": inviter_id}, {"$set": {"success_sales": 0}}) # Reset Cycle
+                # Milestone 3 Sales Tercapai
+                await user.send_message(inviter_id, "🎊 **GOAL! 3 SALES BERHASIL!**\nSelamat, kamu dapat 1 Channel VIP Gratis. Hubungi admin @belaa.")
+                await reff_col.update_one({"user_id": inviter_id}, {"$set": {"success_sales": 0}})
             else:
-                await user.send_message(inviter_id, f"💰 **Sales Sukses!**\nTeman yang kamu ajak baru saja join VIP.\nProgres: **{s_count}/{TARGET_SALES}**")
+                await user.send_message(inviter_id, f"💰 **Sales Sukses!**\nTemanmu join VIP. Progres: **{s_count}/{TARGET_SALES}**")
 
-# --- MAIN ---
+# --- RUN ---
 async def main():
     await user.start()
     await bot.start()
-    print("🚀 ASISTEN AFFILIATE SYNDICATE ONLINE!")
+    print("🚀 ASISTEN @WarungLENDIR_Robot & @belaa AKTIF!")
     await idle()
 
 if __name__ == "__main__":
