@@ -113,7 +113,7 @@ async def assistant_handler(client, msg):
 
     # 3. Filter Harga
     produk_list = ["hijab", "indo", "smp", "sma", "baru", "payment", "satuan", "hemat", "premium", "skandal", "super", "record", "baratt", "fans"]
-    tanya_umum = ["halo", "join", "berapa", "price", "daftar", "list", "mau", "kak", "min", "p", "vip", "info"]
+    tanya_umum = ["halo", "harga", "join", "berapa", "price", "daftar", "list", "mau", "kak", "min", "p", "vip", "info"]
     
     is_new = await pm_users_col.count_documents({"user_id": user_id}) <= 1
     is_order = any(x in text for x in produk_list)
